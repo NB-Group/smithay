@@ -1210,6 +1210,54 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         }
     }
 
+    /// Forward a key event directly to the focused client, bypassing the keyboard grab
+    ///
+    /// This is the counterpart of [`KeyboardHandle::input_forward`] for input that loops
+    /// back through the compositor while a grab is active, such as keys an input method
+    /// does not consume and re-injects through the `zwp_virtual_keyboard_v1` protocol:
+    /// delivering those through the regular forward path would send them back to the
+    /// grab, that is the input method, instead of the focused client.
+    ///
+    /// Delivery behaves exactly like a regular forward, including keymap re-synchronization
+    /// and sending the modifiers after the key event when `mods_changed` is `true`; only
+    /// the grab is skipped.
+    pub fn input_forward_bypassing_grab(
+        &self,
+        data: &mut D,
+        keycode: Keycode,
+        state: KeyState,
+        serial: Serial,
+        time: InputTime,
+        mods_changed: bool,
+    ) {
+        let mut guard = self.arc.internal.lock().unwrap();
+        match state {
+            KeyState::Pressed => {
+                guard.forwarded_pressed_keys.insert(keycode);
+            }
+            KeyState::Released => {
+                guard.forwarded_pressed_keys.remove(&keycode);
+            }
+        };
+
+        // Deliver to the focus directly, without going through the grab. Modifiers are
+        // only sent when the shared seat state actually changed, after the key event
+        // (handled in `KeyboardInnerHandle::input`).
+        let seat = self.get_seat(data);
+        let mods = guard.mods_state;
+        let modifiers = mods_changed.then_some(mods);
+        KeyboardInnerHandle {
+            inner: &mut *guard,
+            seat: &seat,
+        }
+        .input(data, keycode, state, modifiers, serial, time);
+        if guard.focus.is_some() {
+            trace!("Input forwarded to client");
+        } else {
+            trace!("No client currently focused");
+        }
+    }
+
     /// Set the current focus of this keyboard
     ///
     /// If the new focus is different from the previous one, any previous focus
@@ -1698,4 +1746,198 @@ impl<D: SeatHandler + 'static> KeyboardGrab<D> for DefaultGrab {
     }
 
     fn unset(&mut self, _data: &mut D) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::{
+        Seat, SeatHandler, SeatState,
+        pointer::{
+            AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
+            GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
+            GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
+        },
+        touch::{
+            DownEvent, FrameMarker, MotionEvent as TouchMotionEvent, OrientationEvent, ShapeEvent,
+            TouchTarget, UpEvent,
+        },
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// A keyboard focus recording the key events it receives.
+    #[derive(Debug, Clone, Default)]
+    struct Focus {
+        keys: Arc<Mutex<Vec<(Keycode, KeyState)>>>,
+        modifiers: Arc<Mutex<Vec<ModifiersState>>>,
+    }
+
+    impl PartialEq for Focus {
+        fn eq(&self, other: &Self) -> bool {
+            // All handles of a focus are clones of the same recording; comparing the
+            // shared allocations is what the seat's focus tracking means here.
+            Arc::ptr_eq(&self.keys, &other.keys) && Arc::ptr_eq(&self.modifiers, &other.modifiers)
+        }
+    }
+
+    impl Focus {
+        fn keys(&self) -> Vec<(Keycode, KeyState)> {
+            self.keys.lock().unwrap().clone()
+        }
+    }
+
+    impl IsAlive for Focus {
+        fn alive(&self) -> bool {
+            true
+        }
+    }
+
+    impl KeyboardTarget<State> for Focus {
+        fn enter(&self, _: &Seat<State>, _: &mut State, _: Vec<KeysymHandle<'_>>, _: Serial) {}
+        fn leave(&self, _: &Seat<State>, _: &mut State, _: Serial) {}
+        fn key(
+            &self,
+            _: &Seat<State>,
+            _: &mut State,
+            key: KeysymHandle<'_>,
+            state: KeyState,
+            _: Serial,
+            _: InputTime,
+        ) {
+            self.keys.lock().unwrap().push((key.raw_code(), state));
+        }
+        fn modifiers(&self, _: &Seat<State>, _: &mut State, modifiers: ModifiersState, _: Serial) {
+            self.modifiers.lock().unwrap().push(modifiers);
+        }
+    }
+
+    // Unused for this test, but required by the `SeatHandler` associated types.
+    impl PointerTarget<State> for Focus {
+        fn enter(&self, _: &Seat<State>, _: &mut State, _: &MotionEvent) {}
+        fn motion(&self, _: &Seat<State>, _: &mut State, _: &MotionEvent) {}
+        fn relative_motion(&self, _: &Seat<State>, _: &mut State, _: &RelativeMotionEvent) {}
+        fn button(&self, _: &Seat<State>, _: &mut State, _: &ButtonEvent) {}
+        fn axis(&self, _: &Seat<State>, _: &mut State, _: AxisFrame) {}
+        fn frame(&self, _: &Seat<State>, _: &mut State) {}
+        fn gesture_swipe_begin(&self, _: &Seat<State>, _: &mut State, _: &GestureSwipeBeginEvent) {}
+        fn gesture_swipe_update(&self, _: &Seat<State>, _: &mut State, _: &GestureSwipeUpdateEvent) {}
+        fn gesture_swipe_end(&self, _: &Seat<State>, _: &mut State, _: &GestureSwipeEndEvent) {}
+        fn gesture_pinch_begin(&self, _: &Seat<State>, _: &mut State, _: &GesturePinchBeginEvent) {}
+        fn gesture_pinch_update(&self, _: &Seat<State>, _: &mut State, _: &GesturePinchUpdateEvent) {}
+        fn gesture_pinch_end(&self, _: &Seat<State>, _: &mut State, _: &GesturePinchEndEvent) {}
+        fn gesture_hold_begin(&self, _: &Seat<State>, _: &mut State, _: &GestureHoldBeginEvent) {}
+        fn gesture_hold_end(&self, _: &Seat<State>, _: &mut State, _: &GestureHoldEndEvent) {}
+        fn leave(&self, _: &Seat<State>, _: &mut State, _: Serial, _: InputTime) {}
+    }
+
+    impl TouchTarget<State> for Focus {
+        fn down(&self, _: &Seat<State>, _: &mut State, _: &DownEvent) {}
+        fn up(&self, _: &Seat<State>, _: &mut State, _: &UpEvent) {}
+        fn motion(&self, _: &Seat<State>, _: &mut State, _: &TouchMotionEvent) {}
+        fn frame(&self, _: &Seat<State>, _: &mut State, _: FrameMarker) {}
+        fn cancel(&self, _: &Seat<State>, _: &mut State, _: FrameMarker) {}
+        fn shape(&self, _: &Seat<State>, _: &mut State, _: &ShapeEvent) {}
+        fn orientation(&self, _: &Seat<State>, _: &mut State, _: &OrientationEvent) {}
+        fn last_frame(&self, _: &Seat<State>, _: &mut State) -> Option<FrameMarker> {
+            None
+        }
+    }
+
+    struct State {
+        seat_state: SeatState<State>,
+    }
+
+    impl SeatHandler for State {
+        type KeyboardFocus = Focus;
+        type PointerFocus = Focus;
+        type TouchFocus = Focus;
+
+        fn seat_state(&mut self) -> &mut SeatState<Self> {
+            &mut self.seat_state
+        }
+    }
+
+    /// A keyboard grab recording the key events it receives.
+    struct RecordingGrab {
+        start_data: GrabStartData<State>,
+        keys: Arc<Mutex<Vec<(Keycode, KeyState)>>>,
+    }
+
+    impl KeyboardGrab<State> for RecordingGrab {
+        fn input(
+            &mut self,
+            _: &mut State,
+            _: &mut KeyboardInnerHandle<'_, State>,
+            keycode: Keycode,
+            state: KeyState,
+            _: Option<ModifiersState>,
+            _: Serial,
+            _: InputTime,
+        ) {
+            self.keys.lock().unwrap().push((keycode, state));
+        }
+
+        fn set_focus(
+            &mut self,
+            _: &mut State,
+            _: &mut KeyboardInnerHandle<'_, State>,
+            _: Option<Focus>,
+            _: Serial,
+        ) {
+        }
+
+        fn start_data(&self) -> &GrabStartData<State> {
+            &self.start_data
+        }
+
+        fn unset(&mut self, _: &mut State) {}
+    }
+
+    #[test]
+    fn forward_bypassing_grab_delivers_to_focus() {
+        let mut state = State {
+            seat_state: SeatState::new(),
+        };
+        let mut seat = state.seat_state.new_seat("seat");
+        let keyboard = seat
+            .add_keyboard(XkbConfig::default(), 200, 25)
+            .expect("Failed to initialize the keyboard");
+
+        let focus = Focus::default();
+        keyboard.set_focus(&mut state, Some(focus.clone()), SERIAL_COUNTER.next_serial());
+        assert!(focus.keys().is_empty());
+
+        let grab_keys = Arc::new(Mutex::new(Vec::new()));
+        keyboard.set_grab(
+            &mut state,
+            RecordingGrab {
+                start_data: GrabStartData { focus: None },
+                keys: grab_keys.clone(),
+            },
+            SERIAL_COUNTER.next_serial(),
+        );
+        assert!(keyboard.is_grabbed());
+
+        let keycode = Keycode::new(46);
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = InputTime::from_millis(0);
+
+        // A regular forward is delivered to the grab, not the focus.
+        keyboard.input_forward(&mut state, keycode, KeyState::Pressed, serial, time, false);
+        assert_eq!(*grab_keys.lock().unwrap(), vec![(keycode, KeyState::Pressed)]);
+        assert!(focus.keys().is_empty());
+
+        // The bypassing forward is delivered to the focus, not the grab.
+        keyboard.input_forward_bypassing_grab(&mut state, keycode, KeyState::Pressed, serial, time, false);
+        assert_eq!(*grab_keys.lock().unwrap(), vec![(keycode, KeyState::Pressed)]);
+        assert_eq!(focus.keys(), vec![(keycode, KeyState::Pressed)]);
+
+        // The grab keeps receiving regular forwards afterwards.
+        keyboard.input_forward(&mut state, keycode, KeyState::Released, serial, time, false);
+        assert_eq!(
+            *grab_keys.lock().unwrap(),
+            vec![(keycode, KeyState::Pressed), (keycode, KeyState::Released)]
+        );
+        assert_eq!(focus.keys(), vec![(keycode, KeyState::Pressed)]);
+    }
 }

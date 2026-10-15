@@ -14,6 +14,17 @@
   <strong>A smithy for rusty Wayland compositors</strong>
 </p>
 
+> **NB-Group fork notice**: branch `legato-keyboard-direct-delivery` carries one
+> patch on top of baseline `cf43a02acd6b5863909665c67f289f6f3478823a`
+> (byte-identical to the rev pinned by the consumer repo). The patch adds
+> `KeyboardHandle::input_forward_bypassing_grab`, delivering a key event
+> directly to the focused client while a keyboard grab is active (delivery
+> otherwise always routes through the grab); needed for keys an input method
+> does not consume and re-injects via `zwp_virtual_keyboard_v1`, which would
+> otherwise loop back to the grab instead of reaching the focused client. See
+> the consumer repo's docs/adr/0014-wayland-backend-fork.md for the fork
+> policy.
+
 ## Goals
 
 Smithay aims to provide building blocks to create Wayland compositors in Rust. While not
