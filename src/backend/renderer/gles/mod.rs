@@ -28,6 +28,7 @@ pub mod format;
 pub mod profiler;
 mod shaders;
 mod texture;
+pub mod timer;
 mod uniform;
 mod version;
 
@@ -1985,6 +1986,21 @@ impl GlesRenderer {
             self.egl.make_current()?;
         }
         Ok(func(&self.gl))
+    }
+
+    /// Run custom GL calls against the already-current context.
+    ///
+    /// Unlike [`with_context()`](Self::with_context) this never touches
+    /// the EGL bindings: it neither makes the context current nor rebinds
+    /// it (with_context rebinds with *no surface*, which detaches a bound
+    /// window surface mid-frame). The caller must hold a live bind of this
+    /// renderer's backend — the frame body between `bind()` and
+    /// `submit()`.
+    pub fn with_bound_context<F, R>(&mut self, func: F) -> R
+    where
+        F: FnOnce(&ffi::Gles2) -> R,
+    {
+        func(&self.gl)
     }
 
     /// Run custom code in the GL context with GPU profiling.
