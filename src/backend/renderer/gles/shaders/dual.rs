@@ -13,6 +13,11 @@
 //! Unlike the implicit texture program there are no `NO_ALPHA`/`EXTERNAL`
 //! define variants: both inputs must be ordinary non-external `TEXTURE_2D`
 //! textures. Only a normal and a `DEBUG_FLAGS` program are linked.
+//!
+//! Note: the non-instanced draw fallback of
+//! [`GlesFrame::render_texture_dual_from_to`](super::GlesFrame::render_texture_dual_from_to)
+//! mirrors upstream `render_texture` verbatim, including the
+//! `solid_program.attrib_position` reuse — the mirroring is deliberate.
 
 use crate::backend::renderer::gles::*;
 

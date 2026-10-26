@@ -3248,19 +3248,15 @@ impl GlesFrame<'_, '_> {
             )
         };
 
-        // Same damage splitting as render_texture_from_to: opaque regions are
-        // drawn with blending disabled, everything else with the current blend
-        // state. Unlike the single-texture path there is no program-less fast
-        // path, so the split always runs.
+        // Same damage splitting as render_texture_from_to with a custom
+        // program: opaque regions are drawn with blending disabled,
+        // everything else with the current blend state.
         let mut non_opaque_damage = std::mem::take(&mut self.renderer.non_opaque_damage);
         let mut opaque_damage = std::mem::take(&mut self.renderer.opaque_damage);
         non_opaque_damage.clear();
         opaque_damage.clear();
 
-        let is_implicit_opaque = !texture.0.has_alpha && alpha == 1f32;
-        if is_implicit_opaque {
-            opaque_damage.extend_from_slice(damage);
-        } else if alpha != 1f32 || opaque_regions.is_empty() {
+        if alpha != 1f32 || opaque_regions.is_empty() {
             non_opaque_damage.extend_from_slice(damage);
         } else {
             non_opaque_damage.extend_from_slice(damage);
