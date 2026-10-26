@@ -1,7 +1,9 @@
+mod dual;
 mod implicit;
 
 use std::fmt::Write;
 
+pub use dual::*;
 pub use implicit::*;
 
 // define constants
@@ -217,6 +219,76 @@ pub(super) unsafe fn texture_program(
             create_variant(&[shaders::EXTERNAL])?,
         ],
         destruction_callback_sender,
+    })))
+}
+
+/// Compiles and links a dual-texture shader program pair (normal + debug).
+///
+/// The shader source is a fragment shader interpreted as version 100; no
+/// `//_DEFINES_` marker is processed (dual programs have no define
+/// variants). The shader receives the samplers `tex` (unit 0) and `tex1`
+/// (unit 1), plus `matrix`, `tex_matrix` (applies to `tex` only) and
+/// `alpha`; the debug variant additionally receives `tint`.
+///
+/// # Safety
+///
+/// You must call this only when it is safe to compile and link programs with GL.
+pub(super) unsafe fn dual_texture_program(
+    gl: &ffi::Gles2,
+    src: &str,
+    additional_uniforms: &[UniformName<'_>],
+    destruction_callback_sender: Sender<CleanupResource>,
+) -> Result<GlesTexProgramDual, GlesError> {
+    let shader = format!("#version 100\n{}", src);
+    let debug_shader = format!("#version 100\n#define {}\n{}", shaders::DEBUG_FLAGS, src);
+
+    let program = unsafe { link_program(gl, shaders::VERTEX_SHADER, &shader)? };
+    let debug_program = unsafe { link_program(gl, shaders::VERTEX_SHADER, &debug_shader)? };
+
+    let vert = c"vert";
+    let vert_position = c"vert_position";
+    let tex = c"tex";
+    let tex1 = c"tex1";
+    let matrix = c"matrix";
+    let tex_matrix = c"tex_matrix";
+    let alpha = c"alpha";
+    let tint = c"tint";
+
+    let internals = |program: ffi::types::GLuint| -> Result<GlesTexProgramDualInternal, GlesError> {
+        Ok(GlesTexProgramDualInternal {
+            program,
+            uniform_tex: gl.GetUniformLocation(program, tex.as_ptr() as *const ffi::types::GLchar),
+            uniform_tex1: gl.GetUniformLocation(program, tex1.as_ptr() as *const ffi::types::GLchar),
+            uniform_matrix: gl.GetUniformLocation(program, matrix.as_ptr() as *const ffi::types::GLchar),
+            uniform_tex_matrix: gl
+                .GetUniformLocation(program, tex_matrix.as_ptr() as *const ffi::types::GLchar),
+            uniform_alpha: gl.GetUniformLocation(program, alpha.as_ptr() as *const ffi::types::GLchar),
+            attrib_vert: gl.GetAttribLocation(program, vert.as_ptr() as *const ffi::types::GLchar),
+            attrib_vert_position: gl
+                .GetAttribLocation(program, vert_position.as_ptr() as *const ffi::types::GLchar),
+            additional_uniforms: additional_uniforms
+                .iter()
+                .map(|uniform| {
+                    let name = CString::new(uniform.name.as_bytes()).expect("Interior null in name");
+                    let location = gl.GetUniformLocation(program, name.as_ptr() as *const ffi::types::GLchar);
+                    (
+                        uniform.name.clone().into_owned(),
+                        UniformDesc {
+                            location,
+                            type_: uniform.type_,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    };
+
+    Ok(GlesTexProgramDual(Arc::new(GlesTexProgramDualInner {
+        normal: internals(program)?,
+        debug: internals(debug_program)?,
+        destruction_callback_sender,
+        // debug flags
+        uniform_tint: gl.GetUniformLocation(debug_program, tint.as_ptr() as *const ffi::types::GLchar),
     })))
 }
 

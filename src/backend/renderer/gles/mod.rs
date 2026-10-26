@@ -2196,6 +2196,53 @@ impl GlesRenderer {
             )
         }
     }
+
+    /// Compile a custom dual-texture shader for rendering with [`GlesFrame::render_texture_dual_from_to`].
+    ///
+    /// This is the two-sampler counterpart of [`GlesRenderer::compile_custom_texture_shader`],
+    /// which the public API caps at exactly one bound sampler per program. Both textures must be
+    /// ordinary non-external `TEXTURE_2D` textures (there are no `NO_ALPHA`/`EXTERNAL` define
+    /// variants).
+    ///
+    /// The shader receives the following variables:
+    /// - *varying* v_coords `vec2` - contains the position from the vertex shader
+    /// - *uniform* tex `sampler2D` - first texture sampler, bound to texture unit 0
+    /// - *uniform* tex1 `sampler2D` - second texture sampler, bound to texture unit 1
+    /// - *uniform* alpha `float` - for the alpha value passed by the renderer
+    /// - *uniform* tint `float` - for the tint passed by the renderer (either 0.0 or 1.0) - only in the debug variant
+    ///
+    /// The renderer-supplied `matrix` and `tex_matrix` uniforms of [`GlesRenderer::compile_custom_texture_shader`]
+    /// exist as well, but `tex_matrix` applies to `tex` only: coordinates for `tex1` are computed
+    /// by the shader itself (typically from `v_coords` plus additional uniforms).
+    ///
+    /// Additional uniform values can be defined by passing `UniformName`s to the `additional_uniforms` argument
+    /// and can then be set in functions utilizing `GlesTexProgramDual` (like
+    /// [`GlesFrame::render_texture_dual_from_to`]).
+    ///
+    /// The shader must **not** contain a `#version` directive. It will be interpreted as version 100.
+    /// No `//_DEFINES_` marker is processed.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if any of the names of the passed additional uniforms contains a `\0`/NUL-byte.
+    pub fn compile_custom_texture_shader_dual(
+        &mut self,
+        shader: impl AsRef<str>,
+        additional_uniforms: &[UniformName<'_>],
+    ) -> Result<GlesTexProgramDual, GlesError> {
+        unsafe {
+            self.egl.make_current()?;
+        }
+
+        unsafe {
+            dual_texture_program(
+                &self.gl,
+                shader.as_ref(),
+                additional_uniforms,
+                self.gles_cleanup().sender.clone(),
+            )
+        }
+    }
 }
 
 impl GlesFrame<'_, '_> {
@@ -3112,6 +3159,377 @@ impl GlesFrame<'_, '_> {
 
             if self.renderer.capabilities.contains(&Capability::Fencing) {
                 sync_lock.update_read(gl);
+            } else if self.renderer.egl.is_shared() {
+                gl.Finish();
+            };
+        }
+
+        Ok(())
+    }
+
+    /// Render part of two textures as given by `src` (for `texture`) to the current target
+    /// into the rectangle described by `dst` using a dual-texture program.
+    ///
+    /// This is the two-sampler counterpart of [`GlesFrame::render_texture_from_to`]. `texture`
+    /// is bound to unit 0 and sampled through the renderer-supplied `tex_matrix` (built from
+    /// `src`, `dest`, `transform` and the texture's y-orientation, exactly like
+    /// [`GlesFrame::render_texture_from_to`]). `texture1` is bound to unit 1 **without** any
+    /// renderer-supplied matrix: the shader computes its own coordinates for it (typically from
+    /// `v_coords` plus additional uniforms). Both textures must be non-external `TEXTURE_2D`
+    /// textures; `texture1`'s y-orientation is the shader's concern.
+    ///
+    /// The damage/opaque splitting (and thus the blending behavior) matches
+    /// [`GlesFrame::render_texture_from_to`]: opaque regions are drawn with blending disabled,
+    /// everything else with the current blend state. Data-oriented offscreen passes should pass
+    /// their full damage as `opaque_regions` so the writes land with blending disabled.
+    ///
+    /// The renderer's `tex_program_override` does not apply to dual rendering.
+    #[instrument(level = "trace", skip(self), parent = &self.span)]
+    #[profiling::function]
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_texture_dual_from_to(
+        &mut self,
+        texture: &GlesTexture,
+        texture1: &GlesTexture,
+        src: Rectangle<f64, BufferCoord>,
+        dest: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        transform: Transform,
+        alpha: f32,
+        program: &GlesTexProgramDual,
+        additional_uniforms: &[Uniform<'_>],
+    ) -> Result<(), GlesError> {
+        let mut mat = Mat3::IDENTITY;
+
+        // dest position and scale
+        mat *= Mat3::from_translation(Vec2::new(dest.loc.x as f32, dest.loc.y as f32));
+
+        // src scale, position, transform and y_inverted (of texture)
+        let tex_size = texture.size();
+        let src_size = src.size;
+
+        if src_size.is_empty() || tex_size.is_empty() {
+            return Ok(());
+        }
+
+        let mut tex_mat = build_texture_mat(src, dest, tex_size, transform);
+        if texture.0.y_inverted {
+            tex_mat = Mat3::from_cols_array(&[1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]) * tex_mat;
+        }
+
+        let render_texture = |renderer: &mut Self, damage: &[Rectangle<i32, Physical>]| {
+            let instances = damage.iter().flat_map(|rect| {
+                let dest_size = dest.size;
+
+                let rect_constrained_loc = rect.loc.constrain(Rectangle::from_size(dest_size));
+                let rect_clamped_size = rect
+                    .size
+                    .clamp((0, 0), (dest_size.to_point() - rect_constrained_loc).to_size());
+
+                let rect = Rectangle::new(rect_constrained_loc, rect_clamped_size);
+                [
+                    rect.loc.x as f32,
+                    rect.loc.y as f32,
+                    rect.size.w as f32,
+                    rect.size.h as f32,
+                ]
+            });
+
+            renderer.render_texture_dual(
+                texture,
+                texture1,
+                tex_mat,
+                mat,
+                Some(instances),
+                alpha,
+                program,
+                additional_uniforms,
+            )
+        };
+
+        // Same damage splitting as render_texture_from_to: opaque regions are
+        // drawn with blending disabled, everything else with the current blend
+        // state. Unlike the single-texture path there is no program-less fast
+        // path, so the split always runs.
+        let mut non_opaque_damage = std::mem::take(&mut self.renderer.non_opaque_damage);
+        let mut opaque_damage = std::mem::take(&mut self.renderer.opaque_damage);
+        non_opaque_damage.clear();
+        opaque_damage.clear();
+
+        let is_implicit_opaque = !texture.0.has_alpha && alpha == 1f32;
+        if is_implicit_opaque {
+            opaque_damage.extend_from_slice(damage);
+        } else if alpha != 1f32 || opaque_regions.is_empty() {
+            non_opaque_damage.extend_from_slice(damage);
+        } else {
+            non_opaque_damage.extend_from_slice(damage);
+            opaque_damage.extend_from_slice(damage);
+
+            non_opaque_damage =
+                Rectangle::subtract_rects_many_in_place(non_opaque_damage, opaque_regions.iter().copied());
+            opaque_damage =
+                Rectangle::subtract_rects_many_in_place(opaque_damage, non_opaque_damage.iter().copied());
+        }
+
+        tracing::trace!(non_opaque_damage = ?non_opaque_damage, opaque_damage = ?opaque_damage, "drawing dual texture");
+
+        let non_opaque_render_res = if !non_opaque_damage.is_empty() {
+            render_texture(self, &non_opaque_damage)
+        } else {
+            Ok(())
+        };
+
+        let opaque_render_res = if !opaque_damage.is_empty() {
+            unsafe {
+                self.renderer.gl.Disable(ffi::BLEND);
+            }
+
+            let res = render_texture(self, &opaque_damage);
+
+            unsafe {
+                self.renderer.gl.Enable(ffi::BLEND);
+                self.renderer.gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+            }
+
+            res
+        } else {
+            Ok(())
+        };
+
+        // Return the damage(s) to be able to re-use the allocation(s)
+        std::mem::swap(&mut self.renderer.non_opaque_damage, &mut non_opaque_damage);
+        std::mem::swap(&mut self.renderer.opaque_damage, &mut opaque_damage);
+
+        non_opaque_render_res?;
+        opaque_render_res?;
+
+        Ok(())
+    }
+
+    /// Render two textures to the current target using given projection matrix and alpha.
+    ///
+    /// `tex` is bound to unit 0 (sampled through `tex_matrix`), `tex1` to unit 1 (sampled
+    /// with shader-computed coordinates). See [`GlesFrame::render_texture_dual_from_to`]
+    /// for the full contract.
+    #[instrument(level = "trace", skip(self, instances), parent = &self.span)]
+    #[profiling::function]
+    #[allow(clippy::too_many_arguments)]
+    fn render_texture_dual(
+        &mut self,
+        tex: &GlesTexture,
+        tex1: &GlesTexture,
+        tex_matrix: Mat3,
+        mut matrix: Mat3,
+        instances: Option<impl IntoIterator<Item = ffi::types::GLfloat>>,
+        alpha: f32,
+        program: &GlesTexProgramDual,
+        additional_uniforms: &[Uniform<'_>],
+    ) -> Result<(), GlesError> {
+        debug_assert!(
+            !tex.0.is_external && !tex1.0.is_external,
+            "dual-texture programs sample TEXTURE_2D only"
+        );
+
+        // prepare the vertices
+        self.renderer.vertices.clear();
+        let damage_len = if let Some(instances) = instances {
+            if self.renderer.capabilities.contains(&Capability::Instancing) {
+                self.renderer.vertices.extend(instances);
+                self.renderer.vertices.len() / 4
+            } else {
+                let mut damage = 0;
+                let mut instances = instances.into_iter();
+                while let Some(first) = instances.next() {
+                    damage += 1;
+                    let vertices = [
+                        first,
+                        instances.next().unwrap(),
+                        instances.next().unwrap(),
+                        instances.next().unwrap(),
+                    ];
+                    // Add the 4 f32s per damage rectangle for each of the 6 vertices.
+                    for _ in 0..6 {
+                        self.renderer.vertices.extend_from_slice(&vertices);
+                    }
+                }
+                damage
+            }
+        } else if self.renderer.capabilities.contains(&Capability::Instancing) {
+            self.renderer.vertices.extend_from_slice(&[0.0, 0.0, 1.0, 1.0]);
+            1
+        } else {
+            // Add the 4 f32s per damage rectangle for each of the 6 vertices.
+            for _ in 0..6 {
+                self.renderer.vertices.extend_from_slice(&[0.0, 0.0, 1.0, 1.0]);
+            }
+            1
+        };
+
+        if self.renderer.vertices.is_empty() {
+            return Ok(());
+        }
+
+        //apply output transformation
+        matrix = self.current_projection * matrix;
+
+        let dual_program = &program.0;
+        let program = if self.renderer.debug_flags.is_empty() {
+            &dual_program.normal
+        } else {
+            &dual_program.debug
+        };
+
+        // render
+        let gl = &self.renderer.gl;
+        let sync_lock = tex.0.sync.read().unwrap();
+        let sync_lock1 = tex1.0.sync.read().unwrap();
+        unsafe {
+            sync_lock.wait_for_upload(gl);
+            sync_lock1.wait_for_upload(gl);
+            let scope = self
+                .renderer
+                .profiler
+                .scope(gpu_span_location!("render_texture_dual"), gl);
+
+            gl.ActiveTexture(ffi::TEXTURE0);
+            gl.BindTexture(ffi::TEXTURE_2D, tex.0.texture);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MIN_FILTER,
+                match self.renderer.min_filter {
+                    TextureFilter::Nearest => ffi::NEAREST as i32,
+                    TextureFilter::Linear => ffi::LINEAR as i32,
+                },
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MAG_FILTER,
+                match self.renderer.max_filter {
+                    TextureFilter::Nearest => ffi::NEAREST as i32,
+                    TextureFilter::Linear => ffi::LINEAR as i32,
+                },
+            );
+
+            gl.ActiveTexture(ffi::TEXTURE1);
+            gl.BindTexture(ffi::TEXTURE_2D, tex1.0.texture);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MIN_FILTER,
+                match self.renderer.min_filter {
+                    TextureFilter::Nearest => ffi::NEAREST as i32,
+                    TextureFilter::Linear => ffi::LINEAR as i32,
+                },
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MAG_FILTER,
+                match self.renderer.max_filter {
+                    TextureFilter::Nearest => ffi::NEAREST as i32,
+                    TextureFilter::Linear => ffi::LINEAR as i32,
+                },
+            );
+
+            gl.UseProgram(program.program);
+
+            gl.Uniform1i(program.uniform_tex, 0);
+            gl.Uniform1i(program.uniform_tex1, 1);
+            gl.UniformMatrix3fv(program.uniform_matrix, 1, ffi::FALSE, matrix.as_ref().as_ptr());
+            gl.UniformMatrix3fv(
+                program.uniform_tex_matrix,
+                1,
+                ffi::FALSE,
+                tex_matrix.as_ref().as_ptr(),
+            );
+            gl.Uniform1f(program.uniform_alpha, alpha);
+
+            if !self.renderer.debug_flags.is_empty() {
+                let tint = if self.renderer.debug_flags.contains(DebugFlags::TINT) {
+                    1.0f32
+                } else {
+                    0.0f32
+                };
+                gl.Uniform1f(dual_program.uniform_tint, tint);
+            }
+
+            for uniform in additional_uniforms {
+                let desc = program
+                    .additional_uniforms
+                    .get(&*uniform.name)
+                    .ok_or_else(|| GlesError::UnknownUniform(uniform.name.clone().into_owned()))?;
+                uniform.value.set(gl, desc)?;
+            }
+
+            gl.EnableVertexAttribArray(program.attrib_vert as u32);
+            gl.BindBuffer(ffi::ARRAY_BUFFER, self.renderer.vbos[0]);
+            gl.VertexAttribPointer(
+                program.attrib_vert as u32,
+                2,
+                ffi::FLOAT,
+                ffi::FALSE,
+                0,
+                std::ptr::null(),
+            );
+
+            // vert_position
+            gl.EnableVertexAttribArray(program.attrib_vert_position as u32);
+            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+
+            gl.VertexAttribPointer(
+                program.attrib_vert_position as u32,
+                4,
+                ffi::FLOAT,
+                ffi::FALSE,
+                0,
+                self.renderer.vertices.as_ptr() as *const _,
+            );
+
+            if self.renderer.capabilities.contains(&Capability::Instancing) {
+                let _scope = self
+                    .renderer
+                    .profiler
+                    .scope(gpu_span_location!("draw instanced"), gl);
+                gl.VertexAttribDivisor(program.attrib_vert as u32, 0);
+                gl.VertexAttribDivisor(program.attrib_vert_position as u32, 1);
+
+                gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, damage_len as i32);
+            } else {
+                let _scope = self
+                    .renderer
+                    .profiler
+                    .scope(gpu_span_location!("draw batched"), gl);
+
+                // When we have more than 10 rectangles, draw them in batches of 10.
+                for i in 0..(damage_len - 1) / 10 {
+                    gl.DrawArrays(ffi::TRIANGLES, 0, 60);
+
+                    // Set damage pointer to the next 10 rectangles.
+                    gl.VertexAttribPointer(
+                        self.renderer.solid_program.attrib_position as u32,
+                        4,
+                        ffi::FLOAT,
+                        ffi::FALSE,
+                        0,
+                        self.renderer.vertices.as_ptr().add((i + 1) * 60 * 4) as *const _,
+                    );
+                }
+
+                // Draw the up to 10 remaining rectangles.
+                let count = ((damage_len - 1) % 10 + 1) * 6;
+                gl.DrawArrays(ffi::TRIANGLES, 0, count as i32);
+            }
+
+            gl.ActiveTexture(ffi::TEXTURE1);
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+            gl.ActiveTexture(ffi::TEXTURE0);
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+            gl.DisableVertexAttribArray(program.attrib_vert as u32);
+            gl.DisableVertexAttribArray(program.attrib_vert_position as u32);
+            drop(scope);
+
+            if self.renderer.capabilities.contains(&Capability::Fencing) {
+                sync_lock.update_read(gl);
+                sync_lock1.update_read(gl);
             } else if self.renderer.egl.is_shared() {
                 gl.Finish();
             };
